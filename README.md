@@ -8,6 +8,8 @@
 ![python](https://img.shields.io/badge/python-3.8%2B-FFB800)
 ![license](https://img.shields.io/badge/license-MIT-FF2E88)
 
+![Arayüz](arayuz.png)
+
 ---
 
 ## Ne Yapar?
@@ -205,8 +207,10 @@ Detaylı şema: [Microsoft autounattend referansı](https://learn.microsoft.com/
 .
 ├── SegeSystems_SanalPC_Kurulum_v1.py   # Ana program (PyQt5)
 ├── iso.xml                                # Windows autounattend şablonu
+├── arayuz.png                             # Arayüz ekran görüntüsü
 ├── requirements.txt
 ├── README.md
+├── KULLANIM.md
 ├── LICENSE
 └── docs/
     ├── iso-uyumluluk.md                   # Detaylı ISO listesi
