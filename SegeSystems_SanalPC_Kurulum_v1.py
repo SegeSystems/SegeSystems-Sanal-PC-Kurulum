@@ -1707,9 +1707,11 @@ class SegeSystemsGUI(QMainWindow):
                 vmdk_path = os.path.join(vm_path, f'{vm_name}.vmdk')
                 if os.path.exists(self.VDISK_PATH):
                     self.signals.log.emit(self.t('vmdk_log', hdd=hdd_gb), 'info')
+                    # -a lsilogic: SCSI LSI Logic adapter (.vmx ile uyumlu)
+                    # -t 0: tek dosyalı, growable virtual disk
                     self._run_logged(
                         [self.VDISK_PATH, '-c', '-s', f'{hdd_gb}GB',
-                         '-a', 'ide', '-t', '0', vmdk_path],
+                         '-a', 'lsilogic', '-t', '0', vmdk_path],
                         label=f'vmdk[{vm_name}]',
                     )
 
@@ -1774,7 +1776,10 @@ class SegeSystemsGUI(QMainWindow):
         Üretilen config:
           - guestOS = "windows9-64" (Win10/11; eski Win7-Win8.1 ISO'ları
             da bu altında sorunsuz boot eder)
-          - IDE: cdrom-image (kurulum ISO'su, ide1:0) + sanal disk (ide0:0)
+          - SCSI controller (LSI Logic Parallel) + sanal disk (scsi0:0)
+            → BYPASS_KEYS'teki scsi0:0.productID/vendorID anahtarları
+              etkili olur (IDE'de yok sayılıyordu)
+          - IDE üzerinde sadece kurulum ISO'su (ide1:0 cdrom-image)
           - NAT ağ (e1000 sürücüsü)
           - 3D grafik aktif, 256 MB SVGA VRAM
           - cdrom,hdd boot order (kurulumun ISO'dan başlaması için)
@@ -1814,14 +1819,20 @@ class SegeSystemsGUI(QMainWindow):
             f'cpuid.coresPerSocket = "{cpu_n}"\n'
             f'displayName = "{vm_name}"\n'
             'guestOS = "windows9-64"\n'
+            # ── SCSI controller + sistem diski (scsi0:0) ──────────────
+            # LSI Logic Parallel: Win 7/8.1/10/11 default'ta destekler,
+            # ekstra driver disk gerekmez.
+            'scsi0.present = "TRUE"\n'
+            'scsi0.virtualDev = "lsilogic"\n'
+            'scsi0:0.present = "TRUE"\n'
+            f'scsi0:0.fileName = "{vm_name}.vmdk"\n'
+            'scsi0:0.deviceType = "scsi-hardDisk"\n'
+            # ── IDE: sadece kurulum ISO'su (ide1:0 cdrom) ─────────────
             'ide1:0.present = "TRUE"\n'
             'ide1:0.deviceType = "cdrom-image"\n'
             f'ide1:0.fileName = "{iso_safe}"\n'
             'ide1:0.startConnected = "TRUE"\n'
             'ide1:0.autodetect = "TRUE"\n'
-            'ide0:0.present = "TRUE"\n'
-            f'ide0:0.fileName = "{vm_name}.vmdk"\n'
-            'ide0:0.deviceType = "ata-hardDisk"\n'
             + floppy_block +
             'ethernet0.present = "TRUE"\n'
             'ethernet0.virtualDev = "e1000"\n'
@@ -2000,7 +2011,9 @@ class SegeSystemsGUI(QMainWindow):
         '\nmonitor_control.disable_btpriv = "TRUE"'
         '\nmonitor_control.disable_btseg = "TRUE"'
         '\nmonitor_control.restrict_backdoor = "TRUE"'
-        '\nscsi0:0.productID = "SSD"'
+        # Disk kimliği: VM artık SCSI olarak üretildiği için bu satırlar
+        # Device Manager'da gerçekten "Samsung 970 EVO Plus" olarak görünür.
+        '\nscsi0:0.productID = "970 EVO Plus"'
         '\nscsi0:0.vendorID = "Samsung"'
     )
 
