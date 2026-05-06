@@ -1,17 +1,46 @@
 """
-SegeSystems Sanal PC Kurulum Aracı v1.4 — Cyberpunk Edition
+SegeSystems Sanal PC Kurulum Aracı v1
+=====================================
 www.segemacro.com
-"""
-import sys
-import os
-import re
-import subprocess
-import threading
-import time
-import webbrowser
-from datetime import datetime
-from pathlib import Path
 
+VMware Workstation üzerinde toplu Windows VM kurulum aracı.
+
+Akış (özet)
+-----------
+1. Kullanıcı GUI'den ISO + RAM/CPU/disk + adet/isim girer.
+2. Her VM için:
+   - ~/Documents/Virtual Machines/<ad>/ klasörü açılır
+   - <ad>.vmx config dosyası yazılır (donanım: RAM, CPU, disk, NAT, ISO)
+   - <ad>.vmdk sanal disk vmware-vdiskmanager ile yaratılır
+   - (varsa) iso.xml şablonundan <ad>.flp autounattend floppy üretilir
+   - VMware penceresi açılır + vmrun start ile VM güç verilir
+3. Windows ISO'dan boot eder; floppy'deki Autounattend.xml'i bulup
+   soru sormadan kurulumu tamamlar.
+4. "BYPASS ET" butonu kurulum sonrası anti-detection anahtarlarını
+   .vmx dosyalarına enjekte eder, ISO'yu söker, boot'u HDD'ye çevirir.
+
+Mimari
+------
+- PyQt5 main window (`SegeSystemsGUI`)
+- Worker thread'ler kurulum/bypass işlerini yapar
+- `WorkerSignals` Qt sinyalleriyle thread → UI güncellemesi
+- Modül seviyesindeki `build_autounattend_floppy` saf stdlib ile
+  1.44 MB FAT12 floppy imajı üretir (harici bağımlılık yok)
+
+Bağımlılık: PyQt5
+"""
+# ── Standart kütüphane ─────────────────────────────────────────────
+import sys                       # frozen tespiti, exit code, argv
+import os                        # dosya/klasör yolları, makedirs
+import re                        # autounattend.xml ComputerName regex
+import subprocess                # vmrun.exe, vmware.exe, vmware-vdiskmanager
+import threading                 # kurulum/bypass UI'yi bloklamasın
+import time                      # adımlar arası kısa beklemeler
+import webbrowser                # segemacro.com linkini aç
+from datetime import datetime    # log timestamp'leri
+from pathlib import Path         # script dizini için
+
+# ── PyQt5 (tek harici bağımlılık) ──────────────────────────────────
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar, QSlider,
@@ -22,60 +51,123 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QFontDatabase, QIcon
 
 
-# ── Unattended kurulum: stdlib ile tek dosyalı 1.44 MB FAT12 floppy ──
-# Windows Setup boot ederken takılı tüm removable sürücülerin kökünde
-# 'autounattend.xml' arar; floppy'de bulursa otomatik yükler. Bu üretici
-# yalnızca tek bir XML dosyası içeren minimum FAT12 imajı yazar.
+# ════════════════════════════════════════════════════════════════════
+# UNATTENDED FLOPPY ÜRETİCİSİ (saf stdlib, 0 harici bağımlılık)
+# ════════════════════════════════════════════════════════════════════
+# Windows Setup boot ettiğinde takılı tüm removable sürücülerin kökünde
+# "autounattend.xml" arar; bulursa kurulum sorularını otomatik yanıtlar.
+# Bu blok 1.44 MB FAT12 floppy imajı (.flp) üretir; içinde tek dosya:
+# Autounattend.xml. VMware'in floppy0 olarak iliştirdiği bu imajı Windows
+# A: sürücüsü olarak görür ve otomatik tarar.
+#
+# FAT12 Floppy Düzeni (1.44 MB = 2880 sektör × 512 byte):
+#   Sektör  0       : Boot sector + BPB (BIOS Parameter Block)
+#   Sektör  1- 9    : FAT #1 (9 sektör)
+#   Sektör 10-18    : FAT #2 (FAT #1'in birebir kopyası, yedek)
+#   Sektör 19-32    : Root directory (14 sektör, 224 entry × 32 byte)
+#   Sektör 33-2879  : Veri bölgesi (cluster 2'den başlar)
+#
+# Cluster numaralandırması cluster 2'den başlar (cluster 0 ve 1 rezerve).
+# 1 cluster = 1 sektör = 512 byte (floppy'de standart).
 
-_FLP_SECTOR = 512
+_FLP_SECTOR = 512                  # Standart sektör boyutu
 _FLP_TOTAL_SECTORS = 2880          # 2880 × 512 = 1.474.560 byte = 1.44 MB
-_FLP_RESERVED = 1
-_FLP_NUM_FATS = 2
-_FLP_SECTORS_PER_FAT = 9
-_FLP_ROOT_ENTRIES = 224
-_FLP_ROOT_SECTORS = (_FLP_ROOT_ENTRIES * 32 + _FLP_SECTOR - 1) // _FLP_SECTOR  # 14
-_FLP_FAT_BYTES = _FLP_SECTORS_PER_FAT * _FLP_SECTOR
+_FLP_RESERVED = 1                  # Boot sector için ayrılan sektör sayısı
+_FLP_NUM_FATS = 2                  # FAT tablosu sayısı (2'si standart)
+_FLP_SECTORS_PER_FAT = 9           # Her FAT'in kapladığı sektör
+_FLP_ROOT_ENTRIES = 224            # Root dir'de tutulabilen max dizin girişi
+# Root dir'in kapladığı sektör (224 × 32 byte = 7168 byte = 14 sektör):
+_FLP_ROOT_SECTORS = (_FLP_ROOT_ENTRIES * 32 + _FLP_SECTOR - 1) // _FLP_SECTOR
+_FLP_FAT_BYTES = _FLP_SECTORS_PER_FAT * _FLP_SECTOR  # = 4608 byte/FAT
+
+# Veri bölgesinin (cluster 2'nin) imaj içindeki başlangıç offset'i:
+# (1 reserved + 18 FAT + 14 root) × 512 = 16896
 _FLP_DATA_OFFSET = (
     _FLP_RESERVED + _FLP_NUM_FATS * _FLP_SECTORS_PER_FAT + _FLP_ROOT_SECTORS
 ) * _FLP_SECTOR
 
 
 def _fat12_set(arr: bytearray, cluster: int, value: int) -> None:
-    """FAT12 girişine 12 bitlik değeri yaz (her giriş 1.5 bayt)."""
+    """Bir FAT12 girişine 12-bit değer yaz.
+
+    FAT12'de her giriş 1.5 bayt (12 bit) yer kaplar; iki giriş birlikte
+    3 baytı paylaşır. Bu yüzden çift indekslerde alt 12 bit, tek
+    indekslerde üst 12 bit yazılır.
+
+    Args:
+        arr: FAT bayt dizisi (bytearray, in-place değişir)
+        cluster: Yazılacak cluster numarası
+        value: 12 bitlik değer (sonraki cluster numarası ya da 0xFFF=EOF)
+    """
+    # Her cluster ortalama 1.5 bayt → byte offset = cluster + cluster//2
     off = cluster + (cluster // 2)
     if cluster % 2 == 0:
+        # Çift indeks: bu girişin tüm 8 alt biti `off`'a, üst 4 biti
+        # `off+1`'in alt yarısına gider (sonraki tek girişin alt 4'ü
+        # `off+1`'in üst yarısında olduğu için bunu korumak gerek)
         arr[off] = value & 0xFF
         arr[off + 1] = (arr[off + 1] & 0xF0) | ((value >> 8) & 0x0F)
     else:
+        # Tek indeks: alt 4 bit `off`'un üst yarısına, üst 8 bit `off+1`'e
         arr[off] = (arr[off] & 0x0F) | ((value & 0x0F) << 4)
         arr[off + 1] = (value >> 4) & 0xFF
 
 
 def _lfn_checksum(name11: bytes) -> int:
-    """8.3 kısa adın SFN sağlamasını hesapla (LFN entry'lerinde kullanılır)."""
+    """8.3 kısa adın LFN sağlamasını hesapla.
+
+    LFN (Long File Name) girişlerinin her biri, bağlı oldukları kısa
+    8.3 (SFN) girişin sağlamasını içermek zorundadır; eşleşmezse FAT
+    sürücüleri uzun adı reddeder. Algoritma Microsoft FAT spec §7.2.
+
+    Args:
+        name11: 8.3 kısa adın 11 baytlık ham hali (8 base + 3 ext, dot çıkık)
+
+    Returns:
+        0..255 arası tek bayt sağlama değeri
+    """
     s = 0
     for b in name11:
+        # Düşük bitten döndürme + ekleme; FAT spec'inden birebir
         s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
     return s
 
 
 def _make_lfn_entry(seq: int, is_last: bool, chunk: str, chk: int) -> bytes:
-    """Tek bir 32 baytlık LFN dizin girişi üret."""
+    """Tek bir 32 baytlık LFN (Long File Name) dizin girişi üret.
+
+    LFN girişi 13 UCS-2 (UTF-16LE) karakter taşır; üç parçaya bölünür:
+    name1 (5 char), name2 (6 char), name3 (2 char). Doldurulmamış slotlar
+    0xFFFF padding ile doldurulur. LFN girişleri diskte uzun ad parçaları
+    sondan başa sıralı yerleşir; ilk yazılan giriş 0x40 bit'i (LAST_LONG)
+    ile işaretlenir.
+
+    Args:
+        seq: Sıra numarası (1'den başlar, ne kadar parça varsa o kadar)
+        is_last: Diskte ilk yazılan parça mı? (en yüksek seq'li olan)
+        chunk: 13 karakterlik metin parçası (eksikse padding)
+        chk: Kısa adın checksum'ı (tüm LFN girişlerinde aynı olmalı)
+
+    Returns:
+        32 baytlık ham dizin girişi
+    """
     e = bytearray(32)
+    # Byte 0: sıra numarası + 0x40 (sadece son girişte)
     e[0] = seq | (0x40 if is_last else 0)
-    # name1: chars 0..4 (5 char × 2 byte UTF-16LE)
+    # Byte 1-10: name1 (5 karakter × 2 byte UTF-16LE)
     for i in range(5):
-        ch = chunk[i] if i < len(chunk) else '￿'
+        ch = chunk[i] if i < len(chunk) else '￿'  # U+FFFF = padding
         e[1 + i * 2:3 + i * 2] = ord(ch).to_bytes(2, 'little')
-    e[11] = 0x0F  # LFN attribute
-    e[12] = 0
-    e[13] = chk
-    # name2: chars 5..10
+    e[11] = 0x0F  # Attribute byte: 0x0F = LFN sabiti (FAT bunu LFN olarak tanır)
+    e[12] = 0     # Type byte: 0
+    e[13] = chk   # Bağlı kısa adın checksum'ı
+    # Byte 14-25: name2 (6 karakter)
     for i in range(6):
         j = 5 + i
         ch = chunk[j] if j < len(chunk) else '￿'
         e[14 + i * 2:16 + i * 2] = ord(ch).to_bytes(2, 'little')
-    # name3: chars 11..12
+    # Byte 26-27: 0 (cluster alanı, LFN'de kullanılmıyor)
+    # Byte 28-31: name3 (2 karakter)
     for i in range(2):
         j = 11 + i
         ch = chunk[j] if j < len(chunk) else '￿'
@@ -84,87 +176,132 @@ def _make_lfn_entry(seq: int, is_last: bool, chunk: str, chk: int) -> bytes:
 
 
 def build_autounattend_floppy(xml_text: str) -> bytes:
-    """1.44 MB FAT12 floppy imajı üret; içinde tek dosya: Autounattend.xml."""
+    """1.44 MB FAT12 floppy imajı üret; içinde tek dosya: Autounattend.xml.
+
+    Bu fonksiyon Windows Setup'ın boot esnasında bulup okuyabileceği,
+    geçerli bir FAT12 dosya sistemi yazar. VMware'in floppy0 olarak
+    iliştirdiği imaj guest tarafından A: sürücüsü olarak görülür.
+
+    Args:
+        xml_text: Autounattend.xml dosyasının içeriği (Microsoft unattend
+                  şeması). Per-VM özelleştirme için ComputerName vs. çağıran
+                  taraf zaten değiştirmiş olmalı.
+
+    Returns:
+        Tam 1.474.560 baytlık ham FAT12 imaj (1.44 MB). VMware bunu
+        floppy0.fileName olarak doğrudan tüketir.
+    """
+    # Boş 1.44 MB imaj (sıfırla doldurulmuş)
     img = bytearray(_FLP_SECTOR * _FLP_TOTAL_SECTORS)
 
-    # Boot sector + BPB
+    # ── Sektör 0: Boot Sector + BPB ─────────────────────────────────
+    # BPB (BIOS Parameter Block) FAT'in yapısını tanımlar; Windows ve diğer
+    # FAT sürücüleri imajı tanımak için bu alanı okur.
     bs = bytearray(_FLP_SECTOR)
-    bs[0:3] = b'\xEB\x3C\x90'
-    bs[3:11] = b'MSWIN4.1'
-    bs[11:13] = _FLP_SECTOR.to_bytes(2, 'little')
-    bs[13] = 1
-    bs[14:16] = _FLP_RESERVED.to_bytes(2, 'little')
-    bs[16] = _FLP_NUM_FATS
-    bs[17:19] = _FLP_ROOT_ENTRIES.to_bytes(2, 'little')
-    bs[19:21] = _FLP_TOTAL_SECTORS.to_bytes(2, 'little')
-    bs[21] = 0xF0
-    bs[22:24] = _FLP_SECTORS_PER_FAT.to_bytes(2, 'little')
-    bs[24:26] = (18).to_bytes(2, 'little')
-    bs[26:28] = (2).to_bytes(2, 'little')
-    bs[36] = 0x00
-    bs[38] = 0x29
-    bs[39:43] = b'\x12\x34\x56\x78'
-    bs[43:54] = b'AUTOUNAT   '
-    bs[54:62] = b'FAT12   '
-    bs[510:512] = b'\x55\xAA'
+    bs[0:3]   = b'\xEB\x3C\x90'                              # JMP + NOP (boot kodu placeholder)
+    bs[3:11]  = b'MSWIN4.1'                                  # OEM adı (8 karakter)
+    bs[11:13] = _FLP_SECTOR.to_bytes(2, 'little')            # Bayt/sektör (512)
+    bs[13]    = 1                                            # Sektör/cluster (1)
+    bs[14:16] = _FLP_RESERVED.to_bytes(2, 'little')          # Rezerve sektör sayısı (1)
+    bs[16]    = _FLP_NUM_FATS                                # FAT tablosu sayısı (2)
+    bs[17:19] = _FLP_ROOT_ENTRIES.to_bytes(2, 'little')      # Root dir entry kapasitesi (224)
+    bs[19:21] = _FLP_TOTAL_SECTORS.to_bytes(2, 'little')     # Toplam sektör (2880)
+    bs[21]    = 0xF0                                         # Media tipi: 0xF0 = 1.44MB floppy
+    bs[22:24] = _FLP_SECTORS_PER_FAT.to_bytes(2, 'little')   # Sektör/FAT (9)
+    bs[24:26] = (18).to_bytes(2, 'little')                   # Sektör/track (geometri)
+    bs[26:28] = (2).to_bytes(2, 'little')                    # Kafa sayısı (geometri)
+    bs[36]    = 0x00                                         # BIOS sürücü no (floppy: 0x00)
+    bs[38]    = 0x29                                         # Genişletilmiş boot signature
+    bs[39:43] = b'\x12\x34\x56\x78'                          # Volume seri no (rastgele/sabit)
+    bs[43:54] = b'AUTOUNAT   '                               # Volume label (11 byte, padded)
+    bs[54:62] = b'FAT12   '                                  # FS tipi etiketi
+    bs[510:512] = b'\x55\xAA'                                # Boot sector imzası (zorunlu)
     img[0:_FLP_SECTOR] = bs
 
-    # FAT zinciri
+    # ── FAT tablosu (cluster zinciri) ───────────────────────────────
+    # Dosya verisi cluster 2'den başlayan bağlı liste şeklinde tutulur.
+    # Her cluster sonraki cluster'ı işaret eder; son cluster 0xFFF (EOF).
     xml_bytes = xml_text.encode('utf-8')
+    # Dosya kaç cluster yer kaplar? (1 cluster = 1 sektör = 512 byte)
     file_clusters = (len(xml_bytes) + _FLP_SECTOR - 1) // _FLP_SECTOR
     fat = bytearray(_FLP_FAT_BYTES)
-    fat[0] = 0xF0
-    fat[1] = 0xFF
+    fat[0] = 0xF0  # Cluster 0 rezerve, media descriptor'u taşır
+    fat[1] = 0xFF  # Cluster 1 rezerve (0xFFF = EOF işaretleyici)
     fat[2] = 0xFF
+    # Cluster 2'den başlayarak zincirin halkalarını ata
     for i in range(file_clusters):
         cluster = 2 + i
+        # Son cluster ise EOF (0xFFF), aksi halde sonraki cluster
         nxt = cluster + 1 if i < file_clusters - 1 else 0xFFF
         _fat12_set(fat, cluster, nxt)
+    # Her iki FAT kopyasını da yaz (FAT #1 ve aynı içerikli FAT #2 yedek)
     fat_off = _FLP_RESERVED * _FLP_SECTOR
     img[fat_off:fat_off + _FLP_FAT_BYTES] = fat
     img[fat_off + _FLP_FAT_BYTES:fat_off + 2 * _FLP_FAT_BYTES] = fat
 
-    # Root directory: LFN + 8.3 SFN
-    short_name11 = b'AUTOUN~1XML'  # 8 base + 3 ext, dot çıkarılmış
+    # ── Root directory entry'leri ──────────────────────────────────
+    # FAT 8.3 dosya adıyla sınırlı; "Autounattend.xml" 16 karakter, sığmaz.
+    # Bu yüzden iki LFN girişi + bir kısa (SFN) giriş yazıyoruz:
+    #   LFN seq=2 (LAST_LONG bayrağı): "xml" + null + padding
+    #   LFN seq=1                    : "Autounattend."
+    #   SFN "AUTOUN~1.XML"           : asıl dosya bilgisi
+    short_name11 = b'AUTOUN~1XML'  # SFN: 8 base + 3 ext, dot çıkık
     chk = _lfn_checksum(short_name11)
+    # LFN payload'ı: tam ad + null terminator + 0xFFFF padding'lerle
+    # 13 karakterin katlarına yuvarlanır
     lfn = 'Autounattend.xml' + '\x00'
     while len(lfn) % 13 != 0:
-        lfn += '￿'
-    n_lfn = len(lfn) // 13
+        lfn += '￿'  # U+FFFF padding
+    n_lfn = len(lfn) // 13  # "Autounattend.xml" için → 2 LFN entry
 
+    # Root dir'in imaj içindeki başlangıç offset'i
     root_off = (_FLP_RESERVED + _FLP_NUM_FATS * _FLP_SECTORS_PER_FAT) * _FLP_SECTOR
     pos = 0
+    # LFN'ler ters sırayla yazılır: önce en yüksek seq (LAST bayraklı), sonra azalarak
     for i in range(n_lfn):
         seq = n_lfn - i
+        # Seq numarasına karşılık gelen 13 karakterlik parçayı al
         chunk = lfn[(seq - 1) * 13:seq * 13]
-        is_last = (i == 0)
+        is_last = (i == 0)  # Diskte ilk yazılan LFN, LAST_LONG (0x40) işaretli
         img[root_off + pos:root_off + pos + 32] = _make_lfn_entry(
             seq, is_last, chunk, chk,
         )
         pos += 32
 
-    # Kısa (8.3) entry
+    # Kısa 8.3 dizin girişi (asıl dosya kaydı)
     de = bytearray(32)
-    de[0:11] = short_name11
-    de[11] = 0x20  # archive flag
-    de[26:28] = (2).to_bytes(2, 'little')             # ilk cluster
-    de[28:32] = len(xml_bytes).to_bytes(4, 'little')  # boyut
+    de[0:11] = short_name11                              # Byte 0-10: 8.3 ad
+    de[11] = 0x20                                        # Attribute: 0x20 = ARCHIVE
+    # Byte 12-25: tarih/saat alanları (sıfır bırakıldı, FAT bunu tolere eder)
+    de[26:28] = (2).to_bytes(2, 'little')                # İlk cluster numarası (2)
+    de[28:32] = len(xml_bytes).to_bytes(4, 'little')     # Dosya boyutu (byte)
     img[root_off + pos:root_off + pos + 32] = de
 
-    # Dosya verisi (cluster 2'den başlar)
+    # ── Veri bölgesi: cluster 2'ye XML içeriğini yaz ────────────────
+    # Cluster 2'nin imaj offset'i = _FLP_DATA_OFFSET (16896).
+    # Dosya boyutu 1 sektörden büyükse FAT zincirini takip ederek
+    # ardışık cluster'lara yayılır; ardışık atadığımız için
+    # tek bir kopyalama yeterli.
     img[_FLP_DATA_OFFSET:_FLP_DATA_OFFSET + len(xml_bytes)] = xml_bytes
 
     return bytes(img)
 
 
 def script_dir() -> Path:
-    """EXE veya .py olarak çalışırken script dizinini döndür."""
+    """Çalışan scriptin/EXE'nin bulunduğu dizini döndür.
+
+    PyInstaller ile derlenince ``sys.frozen`` True olur ve `__file__`
+    geçici extract klasörünü gösterir; bu durumda EXE'nin gerçek konumu
+    `sys.executable`'dadır. Aksi halde normal `__file__` tabanlı çözüm.
+
+    `iso.xml` arandığı zaman programın yanındaki dosyaya bakılması için.
+    """
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
     return Path(__file__).parent
 
 
-# ── Renk paleti (JSX tasarımıyla bire bir) ─────────────────────────
+# ── Renk paleti ────────────────────────────────────────────────────
 C = {
     'bg':      '#070A0E',
     'panel':   '#0C1117',
@@ -179,10 +316,17 @@ C = {
 }
 
 
-# ── i18n sözlüğü (TR varsayılan + EN) ──────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# i18n SÖZLÜĞÜ (TR varsayılan + EN)
+# ════════════════════════════════════════════════════════════════════
+# Tüm kullanıcıya görünen metinler (başlıklar, butonlar, log mesajları,
+# hata diyalogları, onay metinleri) anahtarla buradan çekilir. Sağ üstteki
+# TR/EN butonlarıyla anlık dil değiştirme `_set_lang()` ile sağlanır.
+# Yeni metin eklerken her iki dile de aynı anahtarı eklemek şart.
+# Format string'lerde {name}, {n}, {ram} vs. .format() ile doldurulur.
 I18N = {
     'tr': {
-        'window_title': 'SEGESYS // vm.forge — SegeSystems Sanal PC Kurulum Aracı v1.4',
+        'window_title': 'SEGESYS // vm.forge — SegeSystems Sanal PC Kurulum Aracı v1',
         'iso_section': 'ISO İMAJI',
         'iso_placeholder': 'ISO dosyası seçin...',
         'select': 'SEÇ',
@@ -256,7 +400,7 @@ I18N = {
         'floppy_written': 'floppy yazıldı · {name}.flp (1.44 MB)',
     },
     'en': {
-        'window_title': 'SEGESYS // vm.forge — SegeSystems Virtual PC Setup Tool v1.4',
+        'window_title': 'SEGESYS // vm.forge — SegeSystems Virtual PC Setup Tool v1',
         'iso_section': 'ISO IMAGE',
         'iso_placeholder': 'select iso file...',
         'select': 'SELECT',
@@ -588,26 +732,45 @@ def cyber_qss(mono: str) -> str:
     """
 
 
-# ── Worker → UI sinyalleri ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# WORKER → UI SİNYALLERİ
+# ════════════════════════════════════════════════════════════════════
+# Kurulum/bypass işleri arka plan thread'inde çalışır. Qt'de UI'ye
+# yalnızca ana thread dokunabilir; bu yüzden worker thread, UI'yi
+# pyqtSignal yayını üzerinden tetikler. Sinyaller ana thread'in event
+# loop'unda işlenir, race condition olmaz.
 class WorkerSignals(QObject):
-    progress  = pyqtSignal(float)
-    status    = pyqtSignal(str)
-    log       = pyqtSignal(str, str)              # mesaj, kind
-    vm_added  = pyqtSignal(str, str, int, int)    # name, ram, hdd, cpu
-    state     = pyqtSignal(str)                   # idle/running/done
-    finished  = pyqtSignal(str, str)
-    error     = pyqtSignal(str, str)
-    reset_btn = pyqtSignal()
+    progress  = pyqtSignal(float)              # 0..1 progress yüzdesi
+    status    = pyqtSignal(str)                # Kısa durum metni (sağ panel)
+    log       = pyqtSignal(str, str)           # (mesaj, kind: ok/info/cmd/sys/err)
+    vm_added  = pyqtSignal(str, str, int, int) # (ad, ram, hdd, cpu) — VM kart ekle
+    state     = pyqtSignal(str)                # 'idle' / 'running' / 'done'
+    finished  = pyqtSignal(str, str)           # (başlık, mesaj) → bilgi diyaloğu
+    error     = pyqtSignal(str, str)           # (başlık, mesaj) → hata diyaloğu
+    reset_btn = pyqtSignal()                   # İşlem bitince butonları aç
 
 
-# ── Custom modda her VM için bir satır ─────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# CUSTOM MOD — TEK VM SATIRI WIDGET'I
+# ════════════════════════════════════════════════════════════════════
+# CUSTOM modda her VM için ayrı yapılandırma satırı. Kullanıcı isim,
+# RAM, CPU ve disk değerlerini bağımsız girer. "+ VM EKLE" yeni satır
+# oluşturur, sağdaki "×" butonu satırı kaldırır.
 class VMRow(QFrame):
+    # Sinyal: silme talebi geldiğinde parent'ı bilgilendir
     removed = pyqtSignal(object)
 
+    # Combobox seçenekleri (RAM_MB tablosuyla senkron olmalı)
     RAM_OPTIONS = ('1GB', '2GB', '4GB', '8GB')
     CPU_OPTIONS = ('1', '2', '4', '8')
 
     def __init__(self, name: str, lang_label: dict):
+        """Yeni VM satırı oluştur.
+
+        Args:
+            name: Varsayılan VM adı (LineEdit'e prefill)
+            lang_label: Aktif dilin I18N sözlüğü ('remove' anahtarı için)
+        """
         super().__init__()
         self.setProperty('class', 'vmrow')
         self.setFixedHeight(46)
@@ -647,6 +810,7 @@ class VMRow(QFrame):
         h.addWidget(rm, 0)
 
     def values(self) -> tuple:
+        """Bu satırın anlık değerlerini (ad, RAM, CPU, HDD) tuple olarak döndür."""
         return (
             self.name_in.text().strip(),
             self.ram_in.currentText(),
@@ -655,24 +819,45 @@ class VMRow(QFrame):
         )
 
 
-class CyberpunkGUI(QMainWindow):
+# ════════════════════════════════════════════════════════════════════
+# ANA UYGULAMA PENCERESİ
+# ════════════════════════════════════════════════════════════════════
+class SegeSystemsGUI(QMainWindow):
+    """SegeSystems Sanal PC Kurulum Aracı — ana pencere.
+
+    Sorumluluklar:
+      - GUI'yi inşa et (titlebar, sol config paneli, sağ log paneli, footer)
+      - Kullanıcı girdilerini doğrula
+      - Kurulum/bypass thread'lerini başlat ve sinyalleri UI'ya yansıt
+      - i18n metin değişimini yönet
+      - autounattend floppy'sini per-VM üret ve .vmx'e iliştir
+    """
+
+    # ── VMware Workstation araçlarının varsayılan yolları ───────────
+    # Farklı yola kuruluysa bu üç sabiti güncellemen gerekir.
     VMRUN_PATH = r'C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'
     VMWARE_PATH = r'C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe'
     VDISK_PATH = r'C:\Program Files (x86)\VMware\VMware Workstation\vmware-vdiskmanager.exe'
+
+    # GUI'deki "1GB", "2GB" gibi seçimleri MB'a çeviren tablo (.vmx'te
+    # `memsize = "1024"` şeklinde MB cinsinden yazılır)
     RAM_MB = {'1GB': 1024, '2GB': 2048, '4GB': 4096, '8GB': 8192}
 
     def __init__(self):
         super().__init__()
-        self.lang = 'tr'
-        self.ram_choice = '2GB'
-        self.cpu_choice = '2'
-        self.mode = 'batch'
-        self._busy = False
+        # ── Uygulama state ──
+        self.lang = 'tr'           # Aktif dil ('tr' veya 'en')
+        self.ram_choice = '2GB'    # Toplu modda seçili RAM
+        self.cpu_choice = '2'      # Toplu modda seçili CPU çekirdek sayısı
+        self.mode = 'batch'        # 'batch' (toplu) veya 'custom'
+        self._busy = False         # Kurulum/bypass çalışıyor mu? (çift tık koruması)
 
+        # Pencere geometrisi — sağ panelin log + VM raf alanına yetecek genişlik
         self.setMinimumSize(1180, 740)
         self.resize(1180, 740)
         self.setWindowTitle(self.t('window_title'))
 
+        # Worker thread → UI köprüsü: sinyalleri slot metodlara bağla
         self.signals = WorkerSignals()
         self.signals.progress.connect(self._set_progress)
         self.signals.status.connect(self._set_status)
@@ -689,10 +874,17 @@ class CyberpunkGUI(QMainWindow):
 
     # ═══ i18n yardımcıları ═════════════════════════════════════════════
     def t(self, key: str, **kwargs) -> str:
+        """Aktif dilde anahtara karşılık gelen metni döndür.
+
+        Anahtar EN sözlüğünde yoksa TR'ye düşer; orada da yoksa anahtar
+        adı kendisi döndürülür (kayıp metinleri fark etmek kolay olsun).
+        kwargs varsa Python str.format() ile placeholder'lar doldurulur.
+        """
         s = I18N[self.lang].get(key, I18N['tr'].get(key, key))
         return s.format(**kwargs) if kwargs else s
 
     def _set_lang(self, lang: str):
+        """Dili değiştir ve tüm görünür metinleri tazele."""
         if lang == self.lang:
             return
         self.lang = lang
@@ -702,6 +894,8 @@ class CyberpunkGUI(QMainWindow):
         self._push_log(f'language → {lang}', 'sys')
 
     def _refresh_texts(self):
+        """Aktif dile göre tüm UI etiketlerini güncelle.
+        Yeni metin eklediğinde buraya da satır eklemeyi unutma."""
         self.setWindowTitle(self.t('window_title'))
         self.iso_section.setText(self.t('iso_section'))
         self.iso_entry.setPlaceholderText(self.t('iso_placeholder'))
@@ -799,7 +993,7 @@ class CyberpunkGUI(QMainWindow):
         # Status göstergesi
         self.state_label = QLabel('● BEKLİYOR')
         self.state_label.setStyleSheet(f"color: {C['cyan']}; font-size: 11px; font-weight: 700;")
-        ver = QLabel('v1.4')
+        ver = QLabel('v1')
         ver.setStyleSheet(f"color: {C['dim']}; font-size: 11px; letter-spacing: 1px;")
         h.addWidget(ver)
         sep = QLabel('//')
@@ -1257,7 +1451,26 @@ class CyberpunkGUI(QMainWindow):
     def _run_logged(self, cmd, label: str, kind: str = 'info',
                     timeout=None, allow_nonzero: bool = False,
                     silent_empty: bool = False):
-        """Bir komut çalıştır ve her satırını log'a yansıt."""
+        """Bir alt-süreci çalıştır ve çıktısının her satırını log'a yansıt.
+
+        Mevcut `subprocess.run` çağrılarını sessizce yutmamak için bu
+        yardımcı kullanılır. stdout satırları normal renkte, stderr
+        satırları hata renginde, sıfır olmayan exit kodu ekstra `err`
+        satırı olarak görünür.
+
+        Args:
+            cmd: Komut listesi (subprocess.run'a aynen geçirilir)
+            label: Log satırlarının önüne eklenen kısa etiket (örn. "vmrun-stop[PC-1]")
+            kind: stdout için kullanılacak log kategorisi
+            timeout: Saniye cinsinden zaman aşımı (None=sınırsız)
+            allow_nonzero: True ise sıfır olmayan exit kodu hata olarak işaretlenmez
+                           (örn. "vm zaten kapalı" durumu için)
+            silent_empty: True ise hiç çıktı yoksa "ok (exit 0)" satırı yazılmaz
+                          (her tıklamada gürültü yapmaması için `vmrun list` gibi)
+
+        Returns:
+            subprocess.CompletedProcess veya None (timeout/OSError'da)
+        """
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
@@ -1295,12 +1508,14 @@ class CyberpunkGUI(QMainWindow):
 
     # ═══ Aksiyonlar ═══════════════════════════════════════════════════
     def open_website(self):
+        """Tarayıcıda segemacro.com aç. Başarısız olursa kullanıcıya manuel link göster."""
         try:
             webbrowser.open('https://www.segemacro.com')
         except Exception:
             QMessageBox.information(self, self.t('info_title'), self.t('web_open_fail'))
 
     def select_iso(self):
+        """Dosya seçici aç → seçilen ISO yolunu LineEdit'e yaz."""
         path, _ = QFileDialog.getOpenFileName(
             self, self.t('iso_section').replace('// ', ''), '',
             'ISO files (*.iso);;All files (*.*)',
@@ -1311,7 +1526,16 @@ class CyberpunkGUI(QMainWindow):
 
     # ── Plan üretimi (batch ya da custom) ─────────────────────────
     def _build_plan(self) -> list:
-        """Kuruluma girecek VM listesini döndür: [(name, ram_str, cpu_int, hdd_int)]."""
+        """Kuruluma girecek VM listesini hazırla.
+
+        İki mod aynı şekle indirgenir: ``[(name, ram_str, cpu_int, hdd_int), ...]``.
+        Toplu modda count + base name'den otomatik üretilir; custom modda
+        her VMRow widget'ından okunur.
+
+        Returns:
+            VM tanımları listesi. Geçersiz girdide boş liste döner;
+            ``validate_inputs()`` zaten önceden çağrılmış olmalı.
+        """
         if self.mode == 'batch':
             try:
                 count = int(self.count_entry.text())
@@ -1332,6 +1556,12 @@ class CyberpunkGUI(QMainWindow):
         return plan
 
     def validate_inputs(self) -> bool:
+        """Kullanıcı girdilerini kontrol et; hatada kullanıcıya bildir.
+
+        ISO yolunun varlığı, sayı/isim alanları, disk minimumu, custom
+        modda mükerrer isim kontrolü. Hata bulunursa diyalog açar,
+        log'a hata satırı yazar ve False döner.
+        """
         if not self.iso_entry.text():
             return self._error(self.t('iso_required'))
         if not os.path.exists(self.iso_entry.text()):
@@ -1371,6 +1601,12 @@ class CyberpunkGUI(QMainWindow):
 
     # ═══ Kurulum ══════════════════════════════════════════════════════
     def start_installation(self):
+        """ÇALIŞTIR butonuna tıklanınca tetiklenen ana giriş noktası.
+
+        Doğrulama yapar, kullanıcıdan onay alır, butonları kilitler ve
+        ağır işi `_installation_thread` içinde arka plan thread'ine atar
+        (UI bloklanmasın diye).
+        """
         if self._busy or not self.validate_inputs():
             return
         plan = self._build_plan()
@@ -1401,6 +1637,23 @@ class CyberpunkGUI(QMainWindow):
         ).start()
 
     def _installation_thread(self, plan: list):
+        """Asıl kurulum işi — arka plan thread'inde çalışır.
+
+        Her VM için sırayla:
+          1. ~/Documents/Virtual Machines/<ad>/ klasörü oluştur
+          2. (varsa) iso.xml şablonundan ComputerName=<ad> ile özelleştirilmiş
+             autounattend.xml içeren bir <ad>.flp floppy yaz
+          3. <ad>.vmx dosyasını yaz (donanım + ISO + floppy referansı)
+          4. <ad>.vmdk sanal diski vmware-vdiskmanager ile yarat
+          5. VMware penceresini aç (vmware.exe Popen)
+          6. vmrun start ile VM'e güç ver
+          7. UI rafına kart ekle
+
+        Hata olursa exception yakalanıp `error` sinyali ile diyaloğa
+        çıkar; her durumda butonlar `reset_btn` ile yeniden açılır.
+        UI'ya doğrudan dokunmaz; her güncelleme `self.signals.*.emit()`
+        üzerinden ana thread'e gönderilir.
+        """
         try:
             if not (os.path.exists(self.VMRUN_PATH) or os.path.exists(self.VMWARE_PATH)):
                 self.signals.log.emit('vmware not found on host', 'err')
@@ -1454,9 +1707,11 @@ class CyberpunkGUI(QMainWindow):
                 vmdk_path = os.path.join(vm_path, f'{vm_name}.vmdk')
                 if os.path.exists(self.VDISK_PATH):
                     self.signals.log.emit(self.t('vmdk_log', hdd=hdd_gb), 'info')
+                    # -a lsilogic: SCSI LSI Logic adapter (.vmx ile uyumlu)
+                    # -t 0: tek dosyalı, growable virtual disk
                     self._run_logged(
                         [self.VDISK_PATH, '-c', '-s', f'{hdd_gb}GB',
-                         '-a', 'ide', '-t', '0', vmdk_path],
+                         '-a', 'lsilogic', '-t', '0', vmdk_path],
                         label=f'vmdk[{vm_name}]',
                     )
 
@@ -1516,6 +1771,35 @@ class CyberpunkGUI(QMainWindow):
     def _vmx_content(vm_name: str, iso_path: str, ram_mb: int,
                      hdd_gb: int, cpu_n: int,
                      floppy_name: str = '') -> str:
+        """Tek bir VM için tam .vmx config dosyasının içeriğini üret.
+
+        Üretilen config:
+          - guestOS = "windows9-64" (Win10/11; eski Win7-Win8.1 ISO'ları
+            da bu altında sorunsuz boot eder)
+          - SCSI controller (LSI Logic Parallel) + sanal disk (scsi0:0)
+            → BYPASS_KEYS'teki scsi0:0.productID/vendorID anahtarları
+              etkili olur (IDE'de yok sayılıyordu)
+          - IDE üzerinde sadece kurulum ISO'su (ide1:0 cdrom-image)
+          - NAT ağ (e1000 sürücüsü)
+          - 3D grafik aktif, 256 MB SVGA VRAM
+          - cdrom,hdd boot order (kurulumun ISO'dan başlaması için)
+          - floppy_name verilmişse floppy0 da iliştirilir (autounattend için)
+
+        Bypass adımı `bios.bootOrder`'ı sonradan "hdd,cdrom"'a çevirir
+        ve `ide1:0.startConnected = FALSE` yapar.
+
+        Args:
+            vm_name: VM ve dosya adı (klasör adıyla aynı tutulur)
+            iso_path: Bağlanacak Windows ISO'sunun tam yolu
+            ram_mb: Bellek (MB)
+            hdd_gb: Disk (GB) — yalnızca log için, asıl disk vmdk yaratılırken
+            cpu_n: vCPU çekirdek sayısı (numvcpus + coresPerSocket aynı yapılır)
+            floppy_name: Aynı klasördeki .flp dosyasının adı; boş ise
+                         floppy bağlanmaz (manuel kurulum modu)
+
+        Returns:
+            UTF-8 metin olarak hazır .vmx içeriği
+        """
         iso_safe = iso_path.replace('\\', '/')
         floppy_block = ''
         if floppy_name:
@@ -1535,14 +1819,20 @@ class CyberpunkGUI(QMainWindow):
             f'cpuid.coresPerSocket = "{cpu_n}"\n'
             f'displayName = "{vm_name}"\n'
             'guestOS = "windows9-64"\n'
+            # ── SCSI controller + sistem diski (scsi0:0) ──────────────
+            # LSI Logic Parallel: Win 7/8.1/10/11 default'ta destekler,
+            # ekstra driver disk gerekmez.
+            'scsi0.present = "TRUE"\n'
+            'scsi0.virtualDev = "lsilogic"\n'
+            'scsi0:0.present = "TRUE"\n'
+            f'scsi0:0.fileName = "{vm_name}.vmdk"\n'
+            'scsi0:0.deviceType = "scsi-hardDisk"\n'
+            # ── IDE: sadece kurulum ISO'su (ide1:0 cdrom) ─────────────
             'ide1:0.present = "TRUE"\n'
             'ide1:0.deviceType = "cdrom-image"\n'
             f'ide1:0.fileName = "{iso_safe}"\n'
             'ide1:0.startConnected = "TRUE"\n'
             'ide1:0.autodetect = "TRUE"\n'
-            'ide0:0.present = "TRUE"\n'
-            f'ide0:0.fileName = "{vm_name}.vmdk"\n'
-            'ide0:0.deviceType = "ata-hardDisk"\n'
             + floppy_block +
             'ethernet0.present = "TRUE"\n'
             'ethernet0.virtualDev = "e1000"\n'
@@ -1559,11 +1849,25 @@ class CyberpunkGUI(QMainWindow):
             'accelerate3d.enable = "TRUE"\n'
         )
 
-    # ─── Unattended autounattend.xml + floppy ───────────────────────
+    # ═══ Unattended Windows kurulumu (autounattend.xml + floppy) ═════
+    # Windows Setup ISO'dan boot ettiğinde tüm removable sürücülerin
+    # kökünde 'autounattend.xml' arar. Programın yanında `iso.xml`
+    # şablonu varsa, her VM için içeriği özelleştirip 1.44 MB FAT12
+    # floppy imajına paketliyor; .vmx'e floppy0 olarak iliştiriyoruz.
+    # Bu sayede HERHANGİ bir Microsoft ISO'su (Win7-Win10/11 Server)
+    # soru sormadan otomatik kurulur. iso.xml yoksa manuel kuruluma
+    # düşer.
+
     def _unattend_template_path(self) -> Path:
+        """iso.xml'in beklenen tam yolunu döndür (script ile aynı klasör)."""
         return script_dir() / 'iso.xml'
 
     def _load_unattend_template(self):
+        """iso.xml dosyasını oku; yoksa veya okunamazsa None döndür.
+
+        None dönmesi 'manuel kurulum modu' demektir — kurulum thread'i
+        floppy üretmez, .vmx'e floppy0 yazmaz.
+        """
         path = self._unattend_template_path()
         if not path.is_file():
             return None
@@ -1575,7 +1879,13 @@ class CyberpunkGUI(QMainWindow):
 
     @staticmethod
     def _customize_unattend(template: str, vm_name: str) -> str:
-        """ComputerName'i VM adıyla değiştir; yoksa olduğu gibi bırak."""
+        """Şablonun <ComputerName> alanını VM adıyla değiştir.
+
+        Aynı şablonla onlarca VM oluşturulduğunda her birinin ağda
+        benzersiz hostname'le açılması için. <ComputerName> tag'i
+        şablonda yoksa olduğu gibi döndürülür (kullanıcı isterse
+        elle ekler).
+        """
         return re.sub(
             r'<ComputerName>[^<]*</ComputerName>',
             f'<ComputerName>{vm_name}</ComputerName>',
@@ -1585,7 +1895,21 @@ class CyberpunkGUI(QMainWindow):
     def _write_unattend_floppy(
         self, vm_path: str, vm_name: str, template: str,
     ) -> str:
-        """Per-VM autounattend.xml içeren .flp dosyasını yaz, ad döndür."""
+        """ComputerName=vm_name özelleştirmeli .flp dosyasını disk'e yaz.
+
+        Şablonu özelleştir, FAT12 imajı üret, vm_path/<vm_name>.flp olarak
+        diske yaz. .vmx içinde floppy0.fileName olarak kullanılacak adı
+        (sadece dosya adı, klasörsüz) döndürür — VMware .vmx'in olduğu
+        klasöre relative çözer.
+
+        Args:
+            vm_path: VM'in klasör yolu (.vmx ile aynı yer)
+            vm_name: ComputerName olarak yazılacak ad ve dosya prefix'i
+            template: iso.xml içeriği (zaten yüklenmiş)
+
+        Returns:
+            Yazılan floppy'nin dosya adı (örn. "PC-1.flp")
+        """
         xml = self._customize_unattend(template, vm_name)
         floppy_name = f'{vm_name}.flp'
         floppy_path = os.path.join(vm_path, floppy_name)
@@ -1596,9 +1920,18 @@ class CyberpunkGUI(QMainWindow):
 
     # ═══ Bypass ═══════════════════════════════════════════════════════
     def start_bypass(self):
+        """⚡ BYPASS ET butonuna tıklanınca tetiklenen anti-detection akışı.
+
+        Akış: VMware Tools onayı → hedef VM listesini belirle (toplu modda
+        base name, custom modda her satırın adı) → arka plan thread'inde
+        her VM'i kapat, .vmx'e bypass anahtarlarını ekle, ISO'yu çıkar.
+        """
         if self._busy:
             return
-        # Bypass için bir hedef ismi gerekli — batch'de base name, custom'da prefix tahmini
+        # Hedef belirleme:
+        #  - Toplu mod: kullanıcı "PC" girmişse, "PC-1, PC-2..." prefix'iyle eşleş
+        #  - Custom mod: VMRow isimlerinin ortak prefix'ini hesapla; thread daha sonra
+        #    isimleri set olarak kullanıp birebir eşleştirme yapar
         if self.mode == 'batch':
             target = self.name_entry.text().strip()
         else:
@@ -1624,11 +1957,19 @@ class CyberpunkGUI(QMainWindow):
 
     @staticmethod
     def _common_prefix(names: list) -> str:
+        """İsim listesinin ortak prefix'ini bul ('-' eki kırpılır).
+
+        Custom modda kullanıcı ['Web-1', 'Web-2', 'Web-3'] yazdıysa
+        'Web' döner. Tek isim varsa ilk '-' segmentini al. Boş listede
+        boş string. Bu prefix bypass thread'inde "X- ile başlayan VM
+        klasörlerini hedefle" şeklinde kullanılır.
+        """
         if not names:
             return ''
         if len(names) == 1:
-            # Tek isim varsa olduğu gibi tarat — ilk segmenti al
             return names[0].split('-')[0]
+        # En küçük ve en büyük string'i karşılaştırarak ortak başlangıç bul
+        # (sözlük sırasında ortada kalanlar bu ikisinin aralarında olur)
         s1, s2 = min(names), max(names)
         i = 0
         while i < len(s1) and i < len(s2) and s1[i] == s2[i]:
@@ -1636,6 +1977,19 @@ class CyberpunkGUI(QMainWindow):
         prefix = s1[:i].rstrip('-')
         return prefix or s1.split('-')[0]
 
+    # ── VMware Anti-Detection Anahtarları ─────────────────────────
+    # Bypass tıklanınca her .vmx dosyasının sonuna bu blok eklenir.
+    # Detaylı açıklamalar için repo'daki docs/bypass.md dosyasına bakın.
+    # Özet:
+    #   - hypervisor.cpuid.v0     → CPUID hypervisor bit'i gizle
+    #   - *.reflectHost           → SMBIOS host bilgisini yansıt
+    #   - SMBIOS.noOEMStrings     → "VMware" OEM string'i temizle
+    #   - isolation.tools.*       → Tools introspection API'lerini kapat
+    #   - monitor_control.disable_*  → BT diagnostics kapat
+    #   - monitor_control.restrict_backdoor + disable_btinout → 0x5658 backdoor kapat
+    #   - scsi0:0.{productID,vendorID} → SCSI disk model spoof
+    #     (Not: program IDE disk kullanıyor; bu iki satır mevcut VM'lere etki etmez,
+    #      ileride SCSI'ye dönüldüğünde lazım olur)
     BYPASS_KEYS = (
         '\nhypervisor.cpuid.v0 = "FALSE"'
         '\nboard-id.reflectHost = "TRUE"'
@@ -1657,11 +2011,28 @@ class CyberpunkGUI(QMainWindow):
         '\nmonitor_control.disable_btpriv = "TRUE"'
         '\nmonitor_control.disable_btseg = "TRUE"'
         '\nmonitor_control.restrict_backdoor = "TRUE"'
-        '\nscsi0:0.productID = "SSD"'
+        # Disk kimliği: VM artık SCSI olarak üretildiği için bu satırlar
+        # Device Manager'da gerçekten "Samsung 970 EVO Plus" olarak görünür.
+        '\nscsi0:0.productID = "970 EVO Plus"'
         '\nscsi0:0.vendorID = "Samsung"'
     )
 
     def _bypass_thread(self, target_prefix: str):
+        """Asıl bypass işi — arka plan thread'inde çalışır.
+
+        Akış:
+          1. ~/Documents/Virtual Machines/ altında hedef VM klasörlerini bul
+             (toplu modda prefix-based, custom modda isim setine göre)
+          2. Her VM için:
+             a. vmrun stop ile çalışıyor olabilen VM'i kapat
+             b. .vmx içeriğini oku
+             c. BYPASS_KEYS bloğunu ekle (zaten varsa atla)
+             d. Boot ayarlarını güncelle: ISO'yu söker, HDD-öncelikli boot
+             e. .vmx'i geri yaz
+          3. Sonuç diyalogu göster
+
+        UI'ya yine sinyal-aracılığıyla dokunur.
+        """
         try:
             vm_root = os.path.join(os.path.expanduser('~'), 'Documents', 'Virtual Machines')
             if not os.path.isdir(vm_root):
@@ -1750,8 +2121,16 @@ class CyberpunkGUI(QMainWindow):
             self.signals.reset_btn.emit()
 
 
-# ── Entry point ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ════════════════════════════════════════════════════════════════════
 def _pick_mono_font() -> str:
+    """Sistemde kurulu monospace yazı tiplerinden CSS family-list'i üret.
+
+    Tercih sırası: JetBrains Mono > Fira Code > Cascadia Code > Consolas
+    > Courier New > Menlo > generic monospace. İlk bulunanı döndürür;
+    hiçbiri yoksa Consolas'a düşer (Windows'ta her zaman var).
+    """
     families = QFontDatabase().families()
     for candidate in ('JetBrains Mono', 'Fira Code', 'Cascadia Code',
                       'Consolas', 'Courier New', 'Menlo', 'monospace'):
@@ -1761,9 +2140,11 @@ def _pick_mono_font() -> str:
 
 
 if __name__ == '__main__':
+    # Qt uygulamasını ayağa kaldır, monospace QSS ile renklendir, ana
+    # pencereyi göster ve event loop'a gir.
     app = QApplication(sys.argv)
     mono = _pick_mono_font()
     app.setStyleSheet(cyber_qss(mono))
-    win = CyberpunkGUI()
+    win = SegeSystemsGUI()
     win.show()
     sys.exit(app.exec_())
