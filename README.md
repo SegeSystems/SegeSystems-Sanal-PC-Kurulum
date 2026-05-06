@@ -1,10 +1,10 @@
-# SegeSystems Sanal PC Kurulum Aracı v1.2
+# SegeSystems Sanal PC Kurulum Aracı v1.2.1
 
 > Çok dilli (TR/EN), toplu Windows VM kurulum aracı.
 > VMware Workstation üzerinde tek tıkla onlarca sanal makineyi otomatik kurar.
 > [www.segemacro.com](https://www.segemacro.com)
 
-![version](https://img.shields.io/badge/version-1.2-00FFA3)
+![version](https://img.shields.io/badge/version-1.2.1-00FFA3)
 ![python](https://img.shields.io/badge/python-3.8%2B-FFB800)
 ![license](https://img.shields.io/badge/license-MIT-FF2E88)
 
@@ -227,6 +227,11 @@ Detaylı şema: [Microsoft autounattend referansı](https://learn.microsoft.com/
 ---
 
 ## Changelog
+
+### v1.2.1 — 2026-05
+- 🐛 **Disk controller fix** — SCSI LSI Logic'in Win 7 boot.wim'inde sürücüsü olmayabildiği için bazı kullanıcılarda Windows kurulum ekranı diski göremiyordu. **SATA AHCI**'ye geçildi — Win Vista+ tüm sürümlerde in-box, problemsiz çalışır.
+- 🛡️ Bypass disk-spoof anahtarları (`scsi0:0.productID/vendorID`) → `sata0:0.productID/vendorID` olarak güncellendi. Aygıt Yöneticisi'nde "Samsung 970 EVO Plus" görünümü korundu.
+- 📝 `vmware-vdiskmanager` çağrısı `-a lsilogic` (descriptor SATA-uyumlu).
 
 ### v1.2 — 2026-05
 - ➕ **Özel base dizini** — VM klasörlerini istediğin sürücüye yönlendir (D:, E:, NAS yolu, vb.). UI'da ISO seçicinin altına eklendi, `settings.json` ile kalıcı.
