@@ -1,10 +1,10 @@
-# SegeSystems Sanal PC Kurulum Aracı v1
+# SegeSystems Sanal PC Kurulum Aracı v1.2
 
 > Çok dilli (TR/EN), toplu Windows VM kurulum aracı.
 > VMware Workstation üzerinde tek tıkla onlarca sanal makineyi otomatik kurar.
 > [www.segemacro.com](https://www.segemacro.com)
 
-![version](https://img.shields.io/badge/version-1.0-00FFA3)
+![version](https://img.shields.io/badge/version-1.2-00FFA3)
 ![python](https://img.shields.io/badge/python-3.8%2B-FFB800)
 ![license](https://img.shields.io/badge/license-MIT-FF2E88)
 
@@ -26,16 +26,19 @@ VMware Workstation ile **tek tek 5 dakika klikleme** yerine programa "3 adet PC 
 
 ## Özellikler
 
-- 🌍 **TR/EN dil seçeneği** — sağ üstte tek tıkla geçiş
+- 🌍 **TR/EN dil seçeneği** — sağ üstte tek tıkla geçiş, son seçim hatırlanır
 - 📦 **İki kurulum modu:**
   - **TOPLU** — adet + isim verirsin, hepsi aynı RAM/CPU/disk ile (`PC-1, PC-2, PC-3`)
   - **CUSTOM** — her VM kendine ayrı ad/RAM/CPU/disk
 - 🔧 **CPU seçimi** — 1/2/4/8 vCPU per VM
 - 💾 **RAM** — 1/2/4/8 GB
 - 💿 **Disk slider** — 10–500 GB
+- 📂 **Özel base dizini** *(v1.2)* — VM'leri D:, E:, başka sürücüye yönlendir; ayar `settings.json`'da kalıcı
+- ⚙️ **Düzenlenebilir bypass anahtarları** *(v1.2)* — UI'dan ⚙ butonu, kaynak koda dokunmadan değiştir; `bypass.txt`'e kaydedilir
 - 📜 **Canlı timestamped log** — `vmrun`, `vmware-vdiskmanager` çıktısı satır satır görünür
 - 🎯 **Aktif VM rafı** — oluşturulan her VM bir kart olarak alta düşer
 - ⚡ **VMware bypass** — kurulum sonrası anti-detection anahtarlarını otomatik enjekte
+- 🛡️ **SCSI disk spoof çalışıyor** *(v1.1)* — Aygıt Yöneticisi'nde "Samsung 970 EVO Plus" görünür
 - 🤖 **Otomatik Windows kurulumu** — `iso.xml` + per-VM floppy ile soru sormadan kurar
 
 ---
@@ -212,10 +215,36 @@ Detaylı şema: [Microsoft autounattend referansı](https://learn.microsoft.com/
 ├── README.md
 ├── KULLANIM.md
 ├── LICENSE
+├── settings.json                          # (otomatik) base_dir + dil tercihi
+├── bypass.txt                             # (opsiyonel) düzenlenmiş bypass anahtarları
 └── docs/
     ├── iso-uyumluluk.md                   # Detaylı ISO listesi
     └── bypass.md                          # Bypass anahtarları açıklaması
 ```
+
+`settings.json` ve `bypass.txt` ilk kullanımda otomatik oluşturulur, repo'ya dahil değildir (.gitignore).
+
+---
+
+## Changelog
+
+### v1.2 — 2026-05
+- ➕ **Özel base dizini** — VM klasörlerini istediğin sürücüye yönlendir (D:, E:, NAS yolu, vb.). UI'da ISO seçicinin altına eklendi, `settings.json` ile kalıcı.
+- ➕ **Düzenlenebilir bypass anahtarları** — `BYPASS ET` butonunun yanına ⚙ ikonu eklendi. Kullanıcı kaynak koda dokunmadan UI'dan anahtarları düzenleyebilir; düzenlemeler `bypass.txt`'e kaydedilir, "Varsayılana Dön" butonu ile geri yüklenir.
+- ➕ **Dil tercihi kalıcı** — TR/EN seçimi `settings.json`'da hatırlanır.
+
+### v1.1 — 2026-05
+- 🐛 **SCSI controller fix** — Diskler artık IDE yerine LSI Logic Parallel SCSI ile oluşturuluyor. Bu sayede `BYPASS_KEYS`'teki `scsi0:0.productID` / `vendorID` anahtarları artık etkili — Aygıt Yöneticisi'nde gerçekten "Samsung 970 EVO Plus" olarak görünür.
+- 📝 `vmware-vdiskmanager` çağrısı `-a ide` → `-a lsilogic` olarak güncellendi.
+- 📝 `BYPASS_KEYS` disk modeli `"SSD"` → `"970 EVO Plus"` (daha gerçekçi).
+
+### v1.0 — 2026-05
+- ✨ İlk yayın
+- ✨ Cyberpunk arayüz, TR/EN dil, toplu/custom mod
+- ✨ 1-8 vCPU, 1-8 GB RAM, 10-500 GB disk seçimi
+- ✨ Otomatik Windows kurulumu (autounattend.xml + FAT12 floppy üreticisi)
+- ✨ VMware bypass — 22 anti-detection anahtarı
+- ✨ Canlı log, aktif VM rafı, durum göstergesi
 
 ---
 
