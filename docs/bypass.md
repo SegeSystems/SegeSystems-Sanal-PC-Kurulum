@@ -96,17 +96,15 @@ monitor_control.restrict_backdoor = "TRUE"
 ### 6) SCSI Disk Kimliği Yansıtma
 
 ```
-scsi0:0.productID = "SSD"
+scsi0:0.productID = "970 EVO Plus"
 scsi0:0.vendorID = "Samsung"
 ```
 
-**Ne yapar:** SCSI diskin model/üretici stringini değiştirir. Normalde VMware SCSI diskleri "VMware Virtual S" / "VMware" olarak rapor eder.
+**Ne yapar:** SCSI diskin model/üretici stringini değiştirir. Bypass sonrası Aygıt Yöneticisi → Disk Sürücüleri'nde "Samsung 970 EVO Plus" olarak görünür (varsayılan: "VMware Virtual S").
 
-⚠️ **Önemli not:** Bu programda VM'ler **IDE disk** ile üretiliyor (`ide0:0`). SCSI değil. Yani bu satırların **etkisi yok** mevcut VM'lerde.
+✅ **Çalışıyor:** v1'den itibaren program artık VM'leri SCSI controller (LSI Logic Parallel) ile üretiyor; bu satırlar gerçekten etkili.
 
-**Çözüm seçenekleri:**
-- Programı SCSI disk üretecek şekilde değiştirmek
-- veya `.vmx`'e elle `ide0:0.productID = "SSD"` eklemek (VMware bu anahtarı IDE için resmi olarak desteklemez ama bazı sürümlerde çalışır)
+📝 **Not:** v1 öncesi sürümlerle (IDE) oluşturulmuş VM'lerde bu satırların etkisi yoktur. Eski VM'leri SCSI'ye migrate etmek için `.vmx`'i elle düzenlemek gerekir (README'de örnek).
 
 ---
 
